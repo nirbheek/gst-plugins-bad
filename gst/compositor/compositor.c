@@ -296,6 +296,17 @@ gst_compositor_pad_set_info (GstVideoAggregatorPad * pad,
   return TRUE;
 }
 
+/* Test whether rectangle (x11, y11, x12, y12) is
+ * obscured by rectangle (x21, y21, x22, y22) */
+static gboolean
+is_rectangle_obscured (gint x11, gint y11, gint x12, gint y12, gint x21,
+    gint y21, gint x22, gint y22)
+{
+  if ((x21 <= x11) && (y21 <= y11) && (x22 >= x12) && (y22 >= y12))
+    return TRUE;
+  return FALSE;
+}
+
 static gboolean
 gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
     GstVideoAggregator * vagg)
@@ -307,6 +318,10 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
   GstVideoFrame *frame;
   static GstAllocationParams params = { 0, 15, 0, 0, };
   gint width, height;
+  gboolean frame_obscured = FALSE;
+  GList *l;
+  /* The two corners of this frame, clamped to the video's boundaries */
+  gint x1, y1, x2, y2;
 
   if (!pad->buffer)
     return TRUE;
@@ -319,6 +334,17 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
     return FALSE;
   }
 
+  /* There's three types of width/height here:
+   * 1. GST_VIDEO_FRAME_WIDTH/HEIGHT:
+   *     The frame width/height (same as vaggpad->info.height/width;
+   *     see gst_video_frame_map())
+   * 2. cpad->width/height:
+   *     The optional pad property for scaling the frame (if zero, the video is
+   *     left unscaled)
+   * 3. conversion_info.width/height:
+   *     Equal to cpad->width/height if it's set, otherwise it's the frame
+   *     width/height. See ->set_info()
+   * */
   if (cpad->width > 0)
     width = cpad->width;
   else
@@ -394,6 +420,52 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
     g_free (wanted_colorimetry);
   }
 
+  /* Clamp the x/y coordinates of the two corners of
+   * this frame to the video boundaries to cover the
+   * case where with negative xpos/ypos, the non-obscured
+   * portion of the frame could be outside the bounds of
+   * the video itself and hence not visible anyway */
+  x1 = CLAMP (0, cpad->xpos, pad->info.width);
+  y1 = CLAMP (0, cpad->ypos, pad->info.height);
+  x2 = CLAMP (0, cpad->xpos + cpad->conversion_info.width, pad->info.width);
+  y2 = CLAMP (0, cpad->ypos + cpad->conversion_info.height, pad->info.height);
+
+  GST_OBJECT_LOCK (vagg);
+  /* Check if this frame is obscured by a higher-zorder frame
+   * TODO: Also skip a frame if it's obscured by a combination of
+   * higher-zorder frames */
+  for (l = g_list_find (GST_ELEMENT (vagg)->sinkpads, pad)->next; l;
+      l = l->next) {
+    GstVideoAggregatorPad *pad2 = l->data;
+    GstCompositorPad *cpad2 = GST_COMPOSITOR_PAD (pad2);
+    /* This is effectively what set_info and the above conversion
+     * code do to calculate the desired width/height */
+    gint cinfo_width2 = cpad2->width ? cpad2->width :
+        cpad2->conversion_info.width;
+    gint cinfo_height2 = cpad2->height ? cpad2->height :
+        cpad2->conversion_info.height;
+
+    /* Check if there's a buffer to be aggregated,
+     * then check opacity and frame boundaries */
+    if (pad2->buffer && cpad2->alpha == 1.0 &&
+        /* We don't need to clamp the coords of the second rectangle */
+        is_rectangle_obscured (x1, y1, x2, y2, cpad2->xpos, cpad2->ypos,
+            cpad2->xpos + cinfo_width2, cpad2->ypos + cinfo_height2)) {
+      frame_obscured = TRUE;
+      GST_DEBUG_OBJECT (pad, "Obscured by %s, skipping frame",
+          GST_PAD_NAME (pad2));
+      break;
+    }
+  }
+  GST_OBJECT_UNLOCK (vagg);
+
+  if (frame_obscured) {
+    converted_frame = NULL;
+    gst_video_frame_unmap (frame);
+    g_slice_free (GstVideoFrame, frame);
+    goto done;
+  }
+
   if (cpad->alpha == 0.0) {
     GST_DEBUG_OBJECT (vagg, "Pad has alpha 0.0, not converting frame");
     converted_frame = NULL;
@@ -428,6 +500,7 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
     converted_frame = frame;
   }
 
+done:
   pad->aggregated_frame = converted_frame;
 
   return TRUE;
@@ -808,6 +881,8 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
   outframe = &out_frame;
   /* default to blending */
   composite = self->blend;
+  /* TODO: If the frames to be composited completely obscure the background,
+   * don't bother drawing the background at all. */
   switch (self->background) {
     case COMPOSITOR_BACKGROUND_CHECKER:
       self->fill_checker (outframe);
