@@ -977,7 +977,7 @@ gst_videoaggregator_fill_queues (GstVideoAggregator * vagg,
     if (buf) {
       GstClockTime start_time, end_time;
 
-      start_time = GST_BUFFER_TIMESTAMP (buf);
+      start_time = GST_BUFFER_PTS (buf);
       if (start_time == -1) {
         gst_buffer_unref (buf);
         GST_DEBUG_OBJECT (pad, "Need timestamped buffers!");
@@ -989,9 +989,11 @@ gst_videoaggregator_fill_queues (GstVideoAggregator * vagg,
 
       /* FIXME: Make all this work with negative rates */
 
-      if ((start_time < GST_BUFFER_TIMESTAMP (buf))
-          || (pad->buffer && start_time < GST_BUFFER_TIMESTAMP (pad->buffer))) {
-        GST_DEBUG_OBJECT (pad, "Buffer from the past, dropping");
+      if ((start_time < GST_BUFFER_PTS (buf))
+          || (pad->buffer && start_time < GST_BUFFER_PTS (pad->buffer))) {
+        GST_WARNING_OBJECT (pad, "Buffer from the past (start time:%"
+            GST_TIME_FORMAT " < buffer pts:%" GST_TIME_FORMAT "), dropping",
+            GST_TIME_ARGS (start_time), GST_TIME_ARGS (GST_BUFFER_PTS (buf)));
         gst_buffer_unref (buf);
         gst_aggregator_pad_drop_buffer (bpad);
         need_more_data = TRUE;
@@ -1071,7 +1073,10 @@ gst_videoaggregator_fill_queues (GstVideoAggregator * vagg,
           GST_TIME_ARGS (output_end_time));
 
       if (pad->priv->end_time != -1 && pad->priv->end_time > end_time) {
-        GST_DEBUG_OBJECT (pad, "Buffer from the past, dropping");
+        GST_WARNING_OBJECT (pad, "Buffer from the past (pad end time:%"
+            GST_TIME_FORMAT " > buffer end time:%" GST_TIME_FORMAT "), "
+            "dropping", GST_TIME_ARGS (pad->priv->end_time),
+            GST_TIME_ARGS (end_time));
         gst_buffer_unref (buf);
         gst_aggregator_pad_drop_buffer (bpad);
         continue;
