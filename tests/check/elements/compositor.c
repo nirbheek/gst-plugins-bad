@@ -33,6 +33,7 @@
 
 #include <gst/check/gstcheck.h>
 #include <gst/check/gstconsistencychecker.h>
+#include <gst/video/gstvideometa.h>
 #include <gst/base/gstbasesrc.h>
 
 #define VIDEO_CAPS_STRING               \
@@ -1096,6 +1097,118 @@ GST_START_TEST (test_segment_base_handling)
 
 GST_END_TEST;
 
+static gboolean buffer_mapped;
+static gboolean (*default_map) (GstVideoMeta * meta, guint plane,
+    GstMapInfo * info, gpointer * data, gint * stride, GstMapFlags flags);
+
+static gboolean
+test_obscured_new_videometa_map (GstVideoMeta * meta, guint plane,
+    GstMapInfo * info, gpointer * data, gint * stride, GstMapFlags flags)
+{
+  buffer_mapped = TRUE;
+  return default_map (meta, plane, info, data, stride, flags);
+}
+
+static GstPadProbeReturn
+test_obscured_pad_probe_cb (GstPad * srcpad, GstPadProbeInfo * info,
+    gpointer user_data)
+{
+  GstBuffer *obuf, *nbuf;
+  GstVideoMeta *meta;
+
+  GST_DEBUG ("pad probe called");
+  /* We need to deep-copy the buffer here because videotestsrc reuses buffers 
+   * and hence the GstVideoMap associated with the buffers, and that causes a
+   * segfault inside videotestsrc when it tries to reuse the buffer */
+  obuf = GST_PAD_PROBE_INFO_BUFFER (info);
+  nbuf = gst_buffer_new ();
+  gst_buffer_copy_into (nbuf, obuf, GST_BUFFER_COPY_ALL | GST_BUFFER_COPY_DEEP,
+      0, -1);
+  meta = gst_buffer_get_video_meta (nbuf);
+  /* Override the default map() function to set also buffer_mapped */
+  default_map = meta->map;
+  meta->map = test_obscured_new_videometa_map;
+  /* Replace the buffer that's going downstream */
+  GST_PAD_PROBE_INFO_DATA (info) = nbuf;
+  gst_buffer_unref (obuf);
+
+  return GST_PAD_PROBE_PASS;
+}
+
+static void
+_test_obscured (gboolean obscure_pad)
+{
+  GstElement *pipeline, *sink, *mix, *src0, *src1;
+  GstPad *srcpad, *sinkpad;
+  GstSample *last_sample = NULL;
+  GstSample *sample;
+
+  GST_INFO ("preparing test");
+
+  pipeline = gst_pipeline_new ("pipeline");
+  src0 = gst_element_factory_make ("videotestsrc", "src0");
+  g_object_set (src0, "num-buffers", 10, NULL);
+  src1 = gst_element_factory_make ("videotestsrc", "src1");
+  g_object_set (src1, "num-buffers", 10, NULL);
+  mix = gst_element_factory_make ("compositor", "compositor");
+  sink = gst_element_factory_make ("appsink", "sink");
+  gst_bin_add_many (GST_BIN (pipeline), src0, src1, mix, sink, NULL);
+  fail_unless (gst_element_link (mix, sink));
+
+  srcpad = gst_element_get_static_pad (src0, "src");
+  sinkpad = gst_element_get_request_pad (mix, "sink_0");
+  fail_unless (gst_pad_link (srcpad, sinkpad) == GST_PAD_LINK_OK);
+  gst_pad_add_probe (srcpad, GST_PAD_PROBE_TYPE_BUFFER,
+      test_obscured_pad_probe_cb, NULL, NULL);
+  gst_object_unref (sinkpad);
+  gst_object_unref (srcpad);
+
+  /* If 'obscure_pad' is TRUE, this pad will obscure sink_0, so buffers from 
+   * sink_0 will never get mapped by compositor. To verify, run with
+   * GST_DEBUG=compositor:6 and look for "Obscured by" messages */
+  srcpad = gst_element_get_static_pad (src1, "src");
+  sinkpad = gst_element_get_request_pad (mix, "sink_1");
+  if (!obscure_pad)
+    /* Offset the positioning by a pixel so that compositor is forced to map, 
+     * convert, and aggregate sink_0 */
+    g_object_set (sinkpad, "xpos", 1, NULL);
+  fail_unless (gst_pad_link (srcpad, sinkpad) == GST_PAD_LINK_OK);
+  gst_object_unref (sinkpad);
+  gst_object_unref (srcpad);
+
+  GST_INFO ("sample prepared");
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  GST_INFO ("PLAYING");
+
+  do {
+    GST_INFO ("sample pulling");
+    g_signal_emit_by_name (sink, "pull-sample", &sample);
+    if (sample == NULL)
+      break;
+    if (last_sample)
+      gst_sample_unref (last_sample);
+    last_sample = sample;
+    GST_INFO ("sample pulled");
+  } while (TRUE);
+  gst_sample_unref (last_sample);
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+}
+
+GST_START_TEST (test_obscured_skipped)
+{
+  buffer_mapped = FALSE;
+  _test_obscured (TRUE);
+  fail_unless (buffer_mapped == FALSE);
+
+  buffer_mapped = FALSE;
+  _test_obscured (FALSE);
+  fail_unless (buffer_mapped == TRUE);
+}
+
+GST_END_TEST;
+
 static Suite *
 compositor_suite (void)
 {
@@ -1115,6 +1228,7 @@ compositor_suite (void)
   tcase_add_test (tc_chain, test_loop);
   tcase_add_test (tc_chain, test_flush_start_flush_stop);
   tcase_add_test (tc_chain, test_segment_base_handling);
+  tcase_add_test (tc_chain, test_obscured_skipped);
 
   /* Use a longer timeout */
 #ifdef HAVE_VALGRIND
