@@ -34,6 +34,7 @@
 #include <gst/check/gstcheck.h>
 #include <gst/check/gstconsistencychecker.h>
 #include <gst/video/gstvideometa.h>
+#include <gst/video/video-frame.h>
 #include <gst/base/gstbasesrc.h>
 
 #define VIDEO_CAPS_STRING               \
@@ -1209,6 +1210,197 @@ GST_START_TEST (test_obscured_skipped)
 
 GST_END_TEST;
 
+static void
+_test_compositing (GstVideoFrame * frame, gint xpos0, gint ypos0, gint zorder0,
+    gint width0, gint height0, gint xpos1, gint ypos1, gint zorder1,
+    gint width1, gint height1)
+{
+  GstElement *pipeline, *sink, *mix, *src0, *src1, *convert;
+  GstElement *cfilter0, *cfilter1, *cfilter;
+  GstPad *srcpad, *sinkpad;
+  GstSample *sample, *last_sample = NULL;
+  GstBuffer *buffer;
+  GstCaps *caps;
+  GstVideoInfo info;
+
+  GST_INFO ("preparing test");
+
+  pipeline = gst_pipeline_new ("pipeline");
+
+  src0 = gst_element_factory_make ("videotestsrc", "src0");
+  g_object_set (src0, "num-buffers", 1, "pattern", 3, NULL);    /* white */
+  cfilter0 = gst_element_factory_make ("capsfilter", "capsfilter0");
+  caps = gst_caps_from_string ("video/x-raw,width=100,height=100");
+  g_object_set (cfilter0, "caps", caps, NULL);
+  gst_caps_unref (caps);
+
+  src1 = gst_element_factory_make ("videotestsrc", "src1");
+  g_object_set (src1, "num-buffers", 1, "pattern", 2, NULL);    /* black */
+  cfilter1 = gst_element_factory_make ("capsfilter", "capsfilter1");
+  caps = gst_caps_from_string ("video/x-raw,width=100,height=100");
+  g_object_set (cfilter1, "caps", caps, NULL);
+  gst_caps_unref (caps);
+
+  mix = gst_element_factory_make ("compositor", "compositor");
+
+  convert = gst_element_factory_make ("videoconvert", "videoconvert");
+  cfilter = gst_element_factory_make ("capsfilter", "capsfilter");
+  caps = gst_caps_from_string ("video/x-raw,format=ARGB");
+  g_object_set (cfilter, "caps", caps, NULL);
+  gst_caps_unref (caps);
+  sink = gst_element_factory_make ("appsink", "sink");
+
+  gst_bin_add_many (GST_BIN (pipeline), src0, src1, mix, convert, cfilter, sink,
+      NULL);
+  fail_unless (gst_element_link_many (mix, convert, cfilter, sink, NULL));
+
+  srcpad = gst_element_get_static_pad (src0, "src");
+  sinkpad = gst_element_get_request_pad (mix, "sink_0");
+  fail_unless (gst_pad_link (srcpad, sinkpad) == GST_PAD_LINK_OK);
+  g_object_set (sinkpad, "xpos", xpos0, "ypos", ypos0, "width", width0,
+      "height", height0, NULL);
+  if (zorder0 >= 0)
+    g_object_set (sinkpad, "zorder", zorder0, NULL);
+  gst_object_unref (sinkpad);
+  gst_object_unref (srcpad);
+
+  srcpad = gst_element_get_static_pad (src1, "src");
+  sinkpad = gst_element_get_request_pad (mix, "sink_1");
+  fail_unless (gst_pad_link (srcpad, sinkpad) == GST_PAD_LINK_OK);
+  g_object_set (sinkpad, "xpos", xpos1, "ypos", ypos1, "width", width1,
+      "height", height1, NULL);
+  if (zorder1 >= 0)
+    g_object_set (sinkpad, "zorder", zorder1, NULL);
+  gst_object_unref (sinkpad);
+  gst_object_unref (srcpad);
+
+  GST_INFO ("test prepared");
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  GST_INFO ("PLAYING");
+
+  do {
+    GST_INFO ("sample pulling");
+    g_signal_emit_by_name (sink, "pull-sample", &sample);
+    if (sample == NULL)
+      break;
+    if (last_sample)
+      gst_sample_unref (last_sample);
+    last_sample = sample;
+    GST_INFO ("sample pulled");
+  } while (TRUE);
+  buffer = gst_sample_get_buffer (last_sample);
+  caps = gst_sample_get_caps (last_sample);
+  fail_unless (gst_video_info_from_caps (&info, caps) == TRUE);
+  fail_unless (gst_video_frame_map (frame, &info, buffer, GST_MAP_READ));
+
+  gst_sample_unref (last_sample);
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+}
+
+GST_START_TEST (test_compositing)
+{
+  gint ii, jj;
+  gint xpos0, xpos1;
+  gint ypos0, ypos1;
+  gint zorder0, zorder1;
+  gint width0, width1;
+  gint height0, height1;
+  gint width, height, stride;
+  GstVideoFrame frame;
+  guint32 black = 0xff000000;
+  guint32 white = 0xffffffff;
+  guint32 pixel;
+  guint8 *data;
+
+  /* Unset */
+  zorder0 = zorder1 = -1;
+  /* Set everything else to compositor defaults */
+  xpos0 = xpos1 = ypos0 = ypos1 = 0;
+  width0 = width1 = height0 = height1 = 0;
+
+  GST_INFO ("testing defaults");
+  /* Defaults, sink_1 (black) will obscure sink_0 (white) */
+  _test_compositing (&frame, xpos0, ypos0, zorder0, width0, height0, xpos1,
+      ypos1, zorder1, width1, height1);
+
+  width = GST_VIDEO_FRAME_WIDTH (&frame);
+  height = GST_VIDEO_FRAME_HEIGHT (&frame);
+  data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+  stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+
+  for (ii = 0; ii < height; ii++) {
+    for (jj = 0; jj < width; jj++) {
+      pixel = GST_READ_UINT32_BE (data);
+      fail_unless (pixel == black);
+      data += 4;
+    }
+    data += stride - 4 * width;
+  }
+  gst_video_frame_unmap (&frame);
+
+  GST_INFO ("testing zorder");
+  /* sink_0 (white) will obscure sink_1 (black) */
+  zorder0 = 2;
+  zorder1 = 1;
+  _test_compositing (&frame, xpos0, ypos0, zorder0, width0, height0, xpos1,
+      ypos1, zorder1, width1, height1);
+
+  width = GST_VIDEO_FRAME_WIDTH (&frame);
+  height = GST_VIDEO_FRAME_HEIGHT (&frame);
+  data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+  stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+
+  for (ii = 0; ii < height; ii++) {
+    for (jj = 0; jj < width; jj++) {
+      pixel = GST_READ_UINT32_BE (data);
+      g_print ("%x\n", pixel);
+      fail_unless (pixel == white);
+      data += 4;
+    }
+    data += stride - 4 * width;
+  }
+  zorder0 = zorder1 = -1;
+  gst_video_frame_unmap (&frame);
+
+  GST_INFO ("testing xpos");
+  /* xpos1 is set, video will be half white, then half black */
+  xpos1 = 50;
+  _test_compositing (&frame, xpos0, ypos0, zorder0, width0, height0, xpos1,
+      ypos1, zorder1, width1, height1);
+  xpos1 = 0;
+  gst_video_frame_unmap (&frame);
+
+  GST_INFO ("testing ypos");
+  /* ypos1 is set, video will be half white, then half black */
+  ypos1 = 50;
+  _test_compositing (&frame, xpos0, ypos0, zorder0, width0, height0, xpos1,
+      ypos1, zorder1, width1, height1);
+  ypos1 = 0;
+  gst_video_frame_unmap (&frame);
+
+  GST_INFO ("testing width/height");
+  /* h/w is set, video will be quarter black (upper left corner), and the rest
+   * white */
+  width1 = height1 = 50;
+  _test_compositing (&frame, xpos0, ypos0, zorder0, width0, height0, xpos1,
+      ypos1, zorder1, width1, height1);
+  width1 = height1 = 0;
+  gst_video_frame_unmap (&frame);
+
+  GST_INFO ("testing width/height + xpos/ypos");
+  /* h/w/xpos/ypos are set, video will be quarter black (lower right corner), 
+   * and the rest white */
+  xpos1 = ypos1 = width1 = height1 = 50;
+  _test_compositing (&frame, xpos0, ypos0, zorder0, width0, height0, xpos1,
+      ypos1, zorder1, width1, height1);
+  xpos1 = ypos1 = width1 = height1 = 0;
+  gst_video_frame_unmap (&frame);
+}
+
+GST_END_TEST;
+
 static Suite *
 compositor_suite (void)
 {
@@ -1229,6 +1421,7 @@ compositor_suite (void)
   tcase_add_test (tc_chain, test_flush_start_flush_stop);
   tcase_add_test (tc_chain, test_segment_base_handling);
   tcase_add_test (tc_chain, test_obscured_skipped);
+  tcase_add_test (tc_chain, test_compositing);
 
   /* Use a longer timeout */
 #ifdef HAVE_VALGRIND
